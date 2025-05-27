@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agentforce Chat</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- Coordinación token + sessionData -->
+  <script>
+    window.sessionData = null;
+    window.tokenReady = false;
+    window.sessionStarted = false;
+
+    function tryStartSession() {
+      if (window.tokenReady && window.sessionData && !window.sessionStarted) {
+        console.log('[Heroku] Ambos listos: token y sessionData, arrancando sesión');
+        createChatSession();
+        window.sessionStarted = true;
+      }
+    }
+
+    // Escucha postMessage desde el LWC
+    window.addEventListener('message', event => {
+      if (event.origin !== 'https://storm-92056ec8b1c6ce.lightning.force.com') return;
+      if (event.data?.type === 'sessionData') {
+        window.sessionData = {
+          cookieId: event.data.cookieId,
+          userId:   event.data.userId
+        };
+        console.log('[Heroku] sessionData recibido:', window.sessionData);
+        tryStartSession();
+      }
+    });
+  </script>
+
+  <h2>Agentforce Chat</h2>
+  <div id="chatbox"></div>
+  <div id="controls">
+    <input type="text" id="userInput" placeholder="Escribe un mensaje..." />
+    <button class="primary" onclick="sendMessage()">Enviar</button>
+    <button class="secondary" onclick="endSession()">Finalizar Chat</button>
+    <button id="dictationBtn" class="mic-button" onclick="toggleDictation()">
+      <svg viewBox="0 0 24 24">
+        <path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3z"></path>
+        <path d="M19 10v1a7 7 0 0 1-14 0v-1"></path>
+        <line x1="12" y1="19" x2="12" y2="23"></line>
+        <line x1="8" y1="23" x2="16" y2="23"></line>
+      </svg>
+    </button>
+    <label class="switch">
+      <input type="checkbox" id="toggleVoice" onchange="toggleVoiceResponse(this)" checked />
+      <span class="slider"></span>
+    </label>
+    <span id="voiceToggleLabel">Leer respuesta en voz</span>
+  </div>
+
+  <script>
+    const serverUrl = window.location.origin;
+    let sessionId = "";
+    let enableVoiceResponse = true;
+    let recognition = null, isDictating = false;
+
+    // Formatea enlaces y saltos de línea
+    function formatBotResponse(text) {
+      let formatted = text
+        .replace(/((http|https):\/\/[^\s]+)/g, '<a href="$1" target="_blank">$1</a>');
+      return formatted.replace(/\n/g, '<br/>');
+    }
+
+    // Dictado por voz
+    function toggleDictation() {
+      if (!('SpeechRecognition' in window) && !('webkitSpeechRecognition' in window)) {
+        alert("Reconocimiento de voz no soportado.");
+        return;
+      }
+      if (!isDictating) {
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        recognition = new SpeechRecognition();
+        recognition.lang = 'es-ES';
+        recognition.start();
+        isDictating = true;
+        document.getElementById("dictationBtn").classList.add("active");
+        recognition.onresult = event => {
+          document.getElementById("userInput").value = event.results[0][0].transcript;
+        };
+        recognition.onerror = e => {
+          console.error("Error dictado:", e.error);
+        };
+        recognition.onend = () => {
+          isDictating = false;
+          document.getElementById("dictationBtn").classList.remove("active");
+        };
+      } else {
+        recognition.stop();
+      }
+    }
+
+    // Toggle respuesta en voz
+    function toggleVoiceResponse(cb) {
+      enableVoiceResponse = cb.checked;
+    }
+
+    // Obtener token OAuth de Salesforce
+    async function getAccessToken() {
+      try {
+        const res = await fetch(`${serverUrl}/get-token`, { method: "POST" });
+        await res.json();
+        console.log("[Heroku] Token obtenido");
+        window.tokenReady = true;
+        tryStartSession();
+      } catch (err) {
+        console.error("[Heroku] Error al obtener token:", err);
+        document.getElementById('chatbox').innerHTML +=
+          `<p class='infoMsg'>Error obteniendo token.</p>`;
+      }
+    }
+
+    // Crear sesión de chat con variables $Context…
+    async function createChatSession() {
+      try {
+        const vars = [];
+        if (window.sessionData.cookieId) {
+          vars.push({
+            name:  '$Context.CookieId__c',
+            type:  'String',
+            value: window.sessionData.cookieId
+          });
+        }
+        if (window.sessionData.userId) {
+          vars.push({
+            name:  '$Context.userId__c',
+            type:  'String',
+            value: window.sessionData.userId
+          });
+        }
+        console.log('[Heroku] Lanzando start-session con variables:', vars);
+        const res = await fetch(`${serverUrl}/start-session`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            externalSessionKey: window.sessionData.cookieId || undefined,
+            instanceConfig:    { endpoint: process.env.SALESFORCE_INSTANCE },
+            variables:         vars,
+            streamingCapabilities: { chunkTypes: ['Text'] },
+            bypassUser:        true
+          })
+        });
+        const data = await res.json();
+        sessionId = data.sessionId;
+        console.log('[Heroku] Session ID:', sessionId);
+        document.getElementById('chatbox').innerHTML +=
+          `<p class='infoMsg'>Sesión creada. ID: ${sessionId}</p>`;
+      } catch (err) {
+        console.error('[Heroku] Error al iniciar sesión:', err);
+        document.getElementById('chatbox').innerHTML +=
+          `<p class='infoMsg'>No se pudo iniciar la sesión.</p>`;
+      }
+    }
+
+    // Enviar mensaje al agente
+    async function sendMessage() {
+      const message = document.getElementById("userInput").value.trim();
+      if (!sessionId) { alert("Sesión no iniciada."); return; }
+      if (!message) return;
+      document.getElementById('chatbox').innerHTML +=
+        `<div class="userMsgContainer">
+           <div class="userMsgBubble"><strong>Tú:</strong> ${message}</div>
+           <img class="userImg" src="https://cdn-icons-png.flaticon.com/512/847/847969.png" />
+         </div>`;
+      document.getElementById('userInput').value = "";
+      document.getElementById('chatbox').innerHTML +=
+        `<p id="botTyping" class="infoMsg">Respondiendo...</p>`;
+      try {
+        const res = await fetch(`${serverUrl}/send-message`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message })
+        });
+        const data = await res.json();
+        document.getElementById("botTyping")?.remove();
+        const botMsg = (data.messages?.[0]?.message) || "No response.";
+        document.getElementById('chatbox').innerHTML +=
+          `<div class="botMsgContainer">
+             <img class="botImg" src="https://wp.salesforce.com/en-us/wp-content/uploads/sites/4/2024/09/img-agent-1.webp" />
+             <div class="botMsgBubble"><strong>Agentforce:</strong> ${formatBotResponse(botMsg)}</div>
+           </div>`;
+        if (enableVoiceResponse) {
+          fetch(`${serverUrl}/synthesize`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: botMsg })
+          })
+          .then(r => r.blob())
+          .then(blob => {
+            const audio = new Audio(URL.createObjectURL(blob));
+            audio.play();
+          })
+          .catch(e => console.error("TTS error:", e));
+        }
+      } catch (e) {
+        console.error("Error al enviar mensaje:", e);
+        document.getElementById("botTyping")?.remove();
+        document.getElementById('chatbox').innerHTML +=
+          `<div class="botMsgContainer">
+             <div class="botMsgBubble"><strong>Agentforce:</strong> <em>Error obteniendo respuesta.</em></div>
+           </div>`;
+      }
+    }
+
+    // Finalizar sesión
+    async function endSession() {
+      if (!sessionId) { alert("No hay sesión activa."); return; }
+      try {
+        await fetch(`${serverUrl}/end-session`, { method: 'DELETE' });
+        document.getElementById('chatbox').innerHTML +=
+          `<p class="infoMsg"><strong>Sesión finalizada.</strong></p>`;
+        sessionId = "";
+      } catch (e) {
+        console.error("Error finalizando sesión:", e);
+        document.getElementById('chatbox').innerHTML +=
+          `<p class="infoMsg">Error al finalizar la sesión.</p>`;
+      }
+    }
+
+    window.onload = () => {
+      getAccessToken();
+    };
+  </script>
+</body>
+</html>
